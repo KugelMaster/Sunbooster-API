@@ -373,7 +373,7 @@ def main() -> None:
 
     # Attribute des Sunbooster Akkus abrufen und ggf. ausgeben
     attrs = get_sunbooster_attributes(access_token)
-    battery_percentage = int(attrs.get("batteryPercentage", "0"))
+    battery_percentage = int(attrs.get("battery_percentage", "0"))
 
     if args.read:
         print(json.dumps(attrs, indent=2, ensure_ascii=False))
