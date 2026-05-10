@@ -258,7 +258,12 @@ def on_ws_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> 
     global received_payload
     logger.debug(f"Received: {msg.payload}")
 
-    received_payload = msg.payload.decode()
+    try:
+        received_payload = msg.payload.decode()
+    except Exception as e:
+        received_payload = None
+        logger.debug(f"Error occurred while processing received message: {e}")
+        logger.debug(f"Server raw payload: {msg.payload.hex()}")
     message_event.set()
 
 
@@ -282,25 +287,35 @@ def setup_mqtt_ws(access_token: str) -> mqtt.Client:
     return client
 
 
-def interpret_response(success_message: str) -> None:
+def interpret_response(success_message: str, message_important: bool = True) -> bool:
     try:
         received_payload_json = json.loads(received_payload or "{}")
         success = received_payload_json.get("status", False) == "succ"
 
         if success:
             logger.info(success_message)
+            return True
         elif "device offline" in received_payload_json.get("msg", ""):
             logger.error("Fehler: Das Gerät ist offline!")
-        else:
+            return False
+        elif message_important:
             logger.error(
                 f"Fehler beim Senden des Aufladen-Befehls. Server Nachricht: '{received_payload_json.get('msg', 'Unbekannter Fehler')}'"
             )
+            return False
+        else:
+            logger.debug(
+                "Keine Erfolgsmeldung erhalten, aber auch keinen Fehler. Weil die Nachricht nicht wichtig ist, wird sie ignoriert."
+            )
+            logger.info(success_message)
+            return True
 
     except json.JSONDecodeError:
         logger.error(f"Failed to decode received payload: {received_payload}")
+        return False
 
 
-def send_charge_cmd(client: mqtt.Client, level: ChargeLevel) -> None:
+def send_charge_cmd(client: mqtt.Client, level: ChargeLevel) -> bool:
     CHARGE_DATA_WORD = "AA AA 00 09 69 00 42 00 13 00 DA 00 "
 
     idx = ["OFF", "NORMAL", "FAST", "SLOW"].index(level)
@@ -310,19 +325,26 @@ def send_charge_cmd(client: mqtt.Client, level: ChargeLevel) -> None:
     client.publish(WS_PUB_TOPIC, payload)
     logger.debug(f"Sent '{data_word_raw}' to topic '{WS_PUB_TOPIC}'")
 
+    success = False
+
     if message_event.wait(timeout=10):
-        interpret_response(
-            f"Der Befehl für das Aufladen des Akkus mit dem Modus '{level}' wurde erfolgreich gesendet."
-            if level != "OFF"
-            else "Der Befehl für das Ausschalten des Aufladens des Akkus wurde erfolgreich gesendet."
+        success = interpret_response(
+            (
+                f"Der Befehl für das Aufladen des Akkus mit dem Modus '{level}' wurde erfolgreich gesendet."
+                if level != "OFF"
+                else "Der Befehl für das Ausschalten des Aufladens des Akkus wurde erfolgreich gesendet."
+            ),
+            message_important=False,
         )
 
     else:
         logger.error("Fehler beim Senden des Aufladen-Befehls")
     message_event.clear()
 
+    return success
 
-def send_output_cmd(client: mqtt.Client, watt: int) -> None:
+
+def send_output_cmd(client: mqtt.Client, watt: int) -> bool:
     OUTPUT_DATA_WORD = "AA AA 00 09 69 00 43 00 13 01 0A 00 "
 
     level = [0, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800].index(watt) # fmt: skip
@@ -334,16 +356,22 @@ def send_output_cmd(client: mqtt.Client, watt: int) -> None:
     client.publish(WS_PUB_TOPIC, payload)
     logger.debug(f"Sent '{data_word_raw}' to topic '{WS_PUB_TOPIC}'")
 
+    success = False
     if message_event.wait(timeout=10):
-        interpret_response(
-            f"Der Befehl für das Einspeisen des Akkus mit {watt}W wurde erfolgreich gesendet."
-            if watt != 0
-            else "Der Befehl für das Beenden des Einspeisens des Akkus wurde erfolgreich gesendet."
+        success = interpret_response(
+            (
+                f"Der Befehl für das Einspeisen des Akkus mit {watt}W wurde erfolgreich gesendet."
+                if watt != 0
+                else "Der Befehl für das Beenden des Einspeisens des Akkus wurde erfolgreich gesendet."
+            ),
+            message_important=False,
         )
 
     else:
         logger.error("Fehler beim Senden des Einspeisen-Befehls!")
     message_event.clear()
+
+    return success
 
 
 ###########################################[Main Method]############################################
@@ -386,10 +414,12 @@ def main() -> None:
     client.connect(WS_BROKER, WS_PORT, keepalive=60)
     client.loop_start()
 
+    success = False
+
     try:
         if args.charge is not None:
             if battery_percentage < 100:
-                send_charge_cmd(client, level=args.charge.upper())
+                success = send_charge_cmd(client, level=args.charge.upper())
             else:
                 logger.error("Der Befehl zum Aufladen des Akkus wird nicht gesendet, weil der Akku bereits voll ist.") # fmt: skip
 
@@ -397,13 +427,15 @@ def main() -> None:
             if battery_percentage <= 15 and battery_percentage > 10:
                 logger.warning(f"Der Akku hat nur noch {battery_percentage}% Ladung.")
             if battery_percentage > 10:
-                send_output_cmd(client, watt=args.output)
+                success = send_output_cmd(client, watt=args.output)
             else:
                 logger.error("Der Befehl zum Einspeisen des Akkus wird nicht gesendet, weil der Akku weniger als 10% Ladung hat.") # fmt: skip
 
     finally:
         client.loop_stop()
         client.disconnect()
+
+    exit(0 if success else -1)
 
 
 if __name__ == "__main__":
